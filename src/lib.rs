@@ -10,6 +10,7 @@ use std::{mem, slice};
 
 mod cipher;
 mod client;
+mod config;
 mod connection;
 mod enums;
 mod error;
@@ -274,7 +275,7 @@ mod tests {
 }
 
 // Keep in sync with Cargo.toml.
-const RUSTLS_CRATE_VERSION: &str = "0.19.0";
+const RUSTLS_CRATE_VERSION: &str = "0.20.0-alpha.0";
 
 /// CastPtr represents the relationship between a snake case type (like rustls_client_session)
 /// and the corresponding Rust type (like ClientSession). For each matched pair of types, there

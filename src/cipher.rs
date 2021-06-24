@@ -83,7 +83,11 @@ pub extern "C" fn rustls_supported_ciphersuite_get_suite(
     supported_ciphersuite: *const rustls_supported_ciphersuite,
 ) -> u16 {
     let supported_ciphersuite = try_ref_from_ptr!(supported_ciphersuite);
-    supported_ciphersuite.suite.get_u16()
+    let cs = match supported_ciphersuite {
+        rustls::SupportedCipherSuite::Tls12(sc) => sc.common,
+        rustls::SupportedCipherSuite::Tls13(sc) => sc.common,
+    };
+    cs.suite.get_u16()
 }
 
 /// Return the length of rustls' list of supported cipher suites.
@@ -101,7 +105,7 @@ pub extern "C" fn rustls_all_ciphersuites_get_entry(
     i: size_t,
 ) -> *const rustls_supported_ciphersuite {
     match ALL_CIPHERSUITES.get(i) {
-        Some(&cs) => cs as *const SupportedCipherSuite as *const _,
+        Some(cs) => cs as *const SupportedCipherSuite as *const _,
         None => null(),
     }
 }
@@ -261,10 +265,7 @@ fn certified_key_build(
         Err(_) => return Err(rustls_result::CertificateParseError),
     };
 
-    Ok(rustls::sign::CertifiedKey::new(
-        parsed_chain,
-        Arc::new(signing_key),
-    ))
+    Ok(rustls::sign::CertifiedKey::new(parsed_chain, signing_key))
 }
 
 /// A root cert store that is done being constructed and is now read-only.
@@ -313,17 +314,17 @@ pub extern "C" fn rustls_root_cert_store_add_pem(
         let certs_pem: &[u8] = try_slice!(pem, pem_len);
         let store: &mut RootCertStore = try_mut_from_ptr!(store);
 
+        let certs_der = match rustls_pemfile::certs(&mut Cursor::new(certs_pem)) {
+            Ok(vv) => vv,
+            Err(_) => return rustls_result::CertificateParseError,
+        };
         // We first copy into a temporary root store so we can uphold our
         // API guideline that there are no partial failures or partial
         // successes.
         let mut new_store = RootCertStore::empty();
-        match new_store.add_pem_file(&mut Cursor::new(certs_pem)) {
-            Ok((parsed, rejected)) => {
-                if strict && (rejected > 0 || parsed == 0) {
-                    return rustls_result::CertificateParseError;
-                }
-            },
-            Err(_) => return rustls_result::CertificateParseError,
+        let (parsed, rejected) = new_store.add_parsable_certificates(&certs_der);
+        if strict && (rejected > 0 || parsed == 0) {
+            return rustls_result::CertificateParseError;
         }
 
         store.roots.append(&mut new_store.roots);

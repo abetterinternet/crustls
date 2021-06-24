@@ -1,8 +1,11 @@
+use std::io::{Read, Write};
 use std::{ffi::c_void, ptr::null};
 use std::{ptr::null_mut, slice};
 
 use libc::{size_t, EIO};
-use rustls::{Certificate, ClientSession, ServerSession, Session, SupportedCipherSuite};
+use rustls::{
+    Certificate, ClientConnection, ServerConnection, SupportedCipherSuite, ALL_CIPHERSUITES,
+};
 
 use crate::io::{CallbackReader, CallbackWriter, ReadCallback, WriteCallback};
 use crate::is_close_notify;
@@ -21,42 +24,39 @@ pub(crate) struct Connection {
     conn: Inner,
     userdata: *mut c_void,
     log_callback: rustls_log_callback,
-    peer_certs: Option<Vec<Certificate>>,
 }
 
 enum Inner {
-    Client(ClientSession),
-    Server(ServerSession),
+    Client(ClientConnection),
+    Server(ServerConnection),
 }
 
 impl Connection {
-    pub(crate) fn from_client(s: ClientSession) -> Self {
+    pub(crate) fn from_client(s: ClientConnection) -> Self {
         Connection {
             conn: Inner::Client(s),
             userdata: null_mut(),
             log_callback: None,
-            peer_certs: None,
         }
     }
 
-    pub(crate) fn from_server(s: ServerSession) -> Self {
+    pub(crate) fn from_server(s: ServerConnection) -> Self {
         Connection {
             conn: Inner::Server(s),
             userdata: null_mut(),
             log_callback: None,
-            peer_certs: None,
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn as_client(&self) -> Option<&ClientSession> {
+    pub(crate) fn as_client(&self) -> Option<&ClientConnection> {
         match &self.conn {
             Inner::Client(c) => Some(c),
             _ => None,
         }
     }
 
-    pub(crate) fn as_server(&self) -> Option<&ServerSession> {
+    pub(crate) fn as_server(&self) -> Option<&ServerConnection> {
         match &self.conn {
             Inner::Server(s) => Some(s),
             _ => None,
@@ -64,7 +64,7 @@ impl Connection {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn as_client_mut(&mut self) -> Option<&mut ClientSession> {
+    pub(crate) fn as_client_mut(&mut self) -> Option<&mut ClientConnection> {
         match &mut self.conn {
             Inner::Client(c) => Some(c),
             _ => None,
@@ -72,7 +72,7 @@ impl Connection {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn as_server_mut(&mut self) -> Option<&mut ServerSession> {
+    pub(crate) fn as_server_mut(&mut self) -> Option<&mut ServerConnection> {
         match &mut self.conn {
             Inner::Server(s) => Some(s),
             _ => None,
@@ -80,8 +80,8 @@ impl Connection {
     }
 }
 
-impl<'conn> AsRef<dyn Session + 'conn> for Connection {
-    fn as_ref(&self) -> &(dyn Session + 'conn) {
+impl<'conn> AsRef<dyn rustls::Connection + 'conn> for Connection {
+    fn as_ref(&self) -> &(dyn rustls::Connection + 'conn) {
         match &self.conn {
             Inner::Client(c) => c,
             Inner::Server(c) => c,
@@ -89,8 +89,8 @@ impl<'conn> AsRef<dyn Session + 'conn> for Connection {
     }
 }
 
-impl<'conn> AsMut<dyn Session + 'conn> for Connection {
-    fn as_mut(&mut self) -> &mut (dyn Session + 'conn) {
+impl<'conn> AsMut<dyn rustls::Connection + 'conn> for Connection {
+    fn as_mut(&mut self) -> &mut (dyn rustls::Connection + 'conn) {
         match &mut self.conn {
             Inner::Client(c) => c,
             Inner::Server(c) => c,
@@ -140,7 +140,7 @@ pub extern "C" fn rustls_connection_set_log_callback(
 /// `rustls_connection_set_userdata`.
 /// Returns 0 for success, or an errno value on error. Passes through return values
 /// from callback. See rustls_read_callback for more details.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.read_tls
+/// https://docs.rs/rustls/0.19.0/rustls/trait.Connection.html#tymethod.read_tls
 #[no_mangle]
 pub extern "C" fn rustls_connection_read_tls(
     conn: *mut rustls_connection,
@@ -173,7 +173,7 @@ pub extern "C" fn rustls_connection_read_tls(
 /// `rustls_connection_set_userdata`.
 /// Returns 0 for success, or an errno value on error. Passes through return values
 /// from callback. See rustls_write_callback for more details.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.write_tls
+/// https://docs.rs/rustls/0.19.0/rustls/trait.Connection.html#tymethod.write_tls
 #[no_mangle]
 pub extern "C" fn rustls_connection_write_tls(
     conn: *mut rustls_connection,
@@ -208,7 +208,7 @@ pub extern "C" fn rustls_connection_process_new_packets(
             Err(_) => return rustls_result::Panic,
         };
         let result = match conn.as_mut().process_new_packets() {
-            Ok(()) => rustls_result::Ok,
+            Ok(_) => rustls_result::Ok,
             Err(e) => map_error(e),
         };
         match guard.try_drop() {
@@ -246,17 +246,17 @@ pub extern "C" fn rustls_connection_is_handshaking(conn: *const rustls_connectio
 /// to completing the TLS handshake) and unsent TLS records. By default, there
 /// is no limit. The limit can be set at any time, even if the current buffer
 /// use is higher.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.set_buffer_limit
+/// https://docs.rs/rustls/0.19.0/rustls/trait.Connection.html#tymethod.set_buffer_limit
 #[no_mangle]
 pub extern "C" fn rustls_connection_set_buffer_limit(conn: *mut rustls_connection, n: usize) {
     ffi_panic_boundary! {
         let conn: &mut Connection = try_mut_from_ptr!(conn);
-        conn.as_mut().set_buffer_limit(n);
+        conn.as_mut().set_buffer_limit(Some(n));
     }
 }
 
 /// Queues a close_notify fatal alert to be sent in the next write_tls call.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.send_close_notify
+/// https://docs.rs/rustls/0.19.0/rustls/trait.Connection.html#tymethod.send_close_notify
 #[no_mangle]
 pub extern "C" fn rustls_connection_send_close_notify(conn: *mut rustls_connection) {
     ffi_panic_boundary! {
@@ -269,29 +269,15 @@ pub extern "C" fn rustls_connection_send_close_notify(conn: *mut rustls_connecti
 /// Index 0 is the end entity certificate. Higher indexes are certificates
 /// in the chain. Requesting an index higher than what is available returns
 /// NULL.
+/// The returned pointer lives as long as the rustls_connection does.
 #[no_mangle]
-pub extern "C" fn rustls_connection_get_peer_certificate(
+pub extern "C" fn rustls_connection_peer_certificate(
     conn: *mut rustls_connection,
     i: size_t,
 ) -> *const rustls_certificate {
-    // TODO: this should be changed in the next rustls release where the
-    // API no longer returns copies but references to the certificates it
-    // keeps. We then no longer have to hold our own Vec.
     ffi_panic_boundary! {
         let conn: &mut Connection = try_mut_from_ptr!(conn);
-        let certs = match &conn.peer_certs {
-            Some(certs) => certs,
-            None => {
-                match conn.as_ref().get_peer_certificates() {
-                    Some(certs) => {
-                        conn.peer_certs = Some(certs);
-                        conn.peer_certs.as_ref().unwrap()
-                    },
-                    None => return null()
-                }
-            }
-        };
-        match certs.get(i) {
+        match conn.as_ref().peer_certificates().and_then(|c| c.get(i)) {
             Some(cert) => cert as *const Certificate as *const _,
             None => null()
         }
@@ -304,9 +290,9 @@ pub extern "C" fn rustls_connection_get_peer_certificate(
 /// If the connection is still handshaking, or no ALPN protocol was negotiated,
 /// stores NULL and 0 in the output parameters.
 /// https://www.iana.org/assignments/tls-parameters/
-/// https://docs.rs/rustls/0.19.1/rustls/trait.Session.html#tymethod.get_alpn_protocol
+/// https://docs.rs/rustls/0.19.1/rustls/trait.Connection.html#tymethod.get_alpn_protocol
 #[no_mangle]
-pub extern "C" fn rustls_connection_get_alpn_protocol(
+pub extern "C" fn rustls_connection_alpn_protocol(
     conn: *const rustls_connection,
     protocol_out: *mut *const u8,
     protocol_out_len: *mut usize,
@@ -315,7 +301,7 @@ pub extern "C" fn rustls_connection_get_alpn_protocol(
         let conn: &Connection = try_ref_from_ptr!(conn);
         let protocol_out = try_mut_from_ptr!(protocol_out);
         let protocol_out_len = try_mut_from_ptr!(protocol_out_len);
-        match conn.as_ref().get_alpn_protocol() {
+        match conn.as_ref().alpn_protocol() {
             Some(p) => {
                 *protocol_out = p.as_ptr();
                 *protocol_out_len = p.len();
@@ -331,13 +317,13 @@ pub extern "C" fn rustls_connection_get_alpn_protocol(
 /// Return the TLS protocol version that has been negotiated. Before this
 /// has been decided during the handshake, this will return 0. Otherwise,
 /// the u16 version number as defined in the relevant RFC is returned.
-/// https://docs.rs/rustls/0.19.1/rustls/trait.Session.html#tymethod.get_protocol_version
+/// https://docs.rs/rustls/0.19.1/rustls/trait.Connection.html#tymethod.get_protocol_version
 /// https://docs.rs/rustls/0.19.1/rustls/internal/msgs/enums/enum.ProtocolVersion.html
 #[no_mangle]
-pub extern "C" fn rustls_connection_get_protocol_version(conn: *const rustls_connection) -> u16 {
+pub extern "C" fn rustls_connection_protocol_version(conn: *const rustls_connection) -> u16 {
     ffi_panic_boundary! {
         let conn: &Connection = try_ref_from_ptr!(conn);
-        match conn.as_ref().get_protocol_version() {
+        match conn.as_ref().protocol_version() {
             Some(p) => p.get_u16(),
             _ => 0,
         }
@@ -346,17 +332,24 @@ pub extern "C" fn rustls_connection_get_protocol_version(conn: *const rustls_con
 
 /// Retrieves the cipher suite agreed with the peer.
 /// This returns NULL until the ciphersuite is agreed.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.get_negotiated_ciphersuite
+/// The returned pointer lives as long as the program.
+/// https://docs.rs/rustls/0.19.0/rustls/trait.Connection.html#tymethod.get_negotiated_ciphersuite
 #[no_mangle]
-pub extern "C" fn rustls_connection_get_negotiated_ciphersuite(
+pub extern "C" fn rustls_connection_negotiated_ciphersuite(
     conn: *const rustls_connection,
 ) -> *const rustls_supported_ciphersuite {
     ffi_panic_boundary! {
         let conn: &Connection = try_ref_from_ptr!(conn);
-        match conn.as_ref().get_negotiated_ciphersuite() {
-            Some(cs) => cs as *const SupportedCipherSuite as *const _,
-            None => null(),
+        let negotiated = match conn.as_ref().negotiated_cipher_suite() {
+            Some(cs) => cs,
+            None => return null(),
+        };
+        for &cs in ALL_CIPHERSUITES {
+            if negotiated == cs {
+                return &cs as *const SupportedCipherSuite as *const _;
+            }
         }
+        null()
     }
 }
 
@@ -381,7 +374,7 @@ pub extern "C" fn rustls_connection_write(
                 None => return NullParameter,
             }
         };
-        let n_written: usize = match conn.as_mut().write(write_buf) {
+        let n_written: usize = match conn.as_mut().writer().write(write_buf) {
             Ok(n) => n,
             Err(_) => return rustls_result::Io,
         };
@@ -413,10 +406,10 @@ pub extern "C" fn rustls_connection_read(
         let read_buf: &mut [u8] = try_mut_slice!(buf, count);
         let out_n: &mut size_t = try_mut_from_ptr!(out_n);
 
-        let n_read: usize = match conn.as_mut().read(read_buf) {
+        let n_read: usize = match conn.as_mut().reader().read(read_buf) {
             Ok(n) => n,
             // Rustls turns close_notify alerts into `io::Error` of kind `ConnectionAborted`.
-            // https://docs.rs/rustls/0.19.0/rustls/struct.ClientSession.html#impl-Read.
+            // https://docs.rs/rustls/0.19.0/rustls/struct.ClientConnection.html#impl-Read.
             Err(e) if is_close_notify(&e) => {
                 return rustls_result::AlertCloseNotify;
             }

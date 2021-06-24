@@ -1,29 +1,24 @@
-use std::ffi::OsStr;
+use std::convert::TryInto;
+use std::ffi::{CStr, OsStr};
 use std::fs::File;
 use std::io::BufReader;
 use std::slice;
 use std::sync::Arc;
-use std::{convert::TryInto, ffi::CStr};
+use std::time::SystemTime;
 
 use libc::{c_char, size_t};
 use rustls::{
-    Certificate, ClientConfig, ClientSession, RootCertStore, ServerCertVerified,
-    SupportedCipherSuite, TLSError, ALL_CIPHERSUITES,
+    Certificate, ClientConfig, ClientConnection, RootCertStore, ServerCertVerified,
+    SupportedCipherSuite, ALL_CIPHERSUITES,
 };
-
-use webpki::DNSNameRef;
 
 use crate::cipher::{rustls_root_cert_store, rustls_supported_ciphersuite};
 use crate::connection::{rustls_connection, Connection};
 use crate::enums::rustls_tls_version_from_u16;
 use crate::error::rustls_result::{InvalidParameter, NullParameter};
-use crate::error::{self, result_to_tlserror, rustls_result};
+use crate::error::{self, result_to_error, rustls_result};
 use crate::rslice::NulByte;
 use crate::rslice::{rustls_slice_bytes, rustls_slice_slice_bytes, rustls_str};
-use crate::session::{
-    rustls_session_store_get_callback, rustls_session_store_put_callback, SessionStoreBroker,
-    SessionStoreGetCallback, SessionStorePutCallback,
-};
 use crate::{
     arc_with_incref_from_raw, ffi_panic_boundary, try_mut_from_ptr, try_ref_from_ptr, try_slice,
     userdata_get, CastPtr,
@@ -139,6 +134,7 @@ type VerifyCallback = unsafe extern "C" fn(
 
 // An implementation of rustls::ServerCertVerifier based on a C callback.
 struct Verifier {
+    roots: RootCertStore,
     callback: VerifyCallback,
 }
 
@@ -153,52 +149,48 @@ unsafe impl Sync for Verifier {}
 impl rustls::ServerCertVerifier for Verifier {
     fn verify_server_cert(
         &self,
-        roots: &RootCertStore,
-        presented_certs: &[Certificate],
-        dns_name: DNSNameRef<'_>,
+        end_entity: &Certificate,
+        intermediates: &[Certificate],
+        server_name: &rustls::ServerName,
+        scts: &mut dyn Iterator<Item = &[u8]>,
         ocsp_response: &[u8],
-    ) -> Result<ServerCertVerified, TLSError> {
+        now: SystemTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
         let cb = self.callback;
-        let dns_name: &str = dns_name.into();
+        let dns_name: &str = match server_name {
+            rustls::ServerName::DnsName(n) => n.as_ref().into(),
+            _ => return Err(rustls::Error::General("unknown name type".to_string())),
+        };
         let dns_name: rustls_str = match dns_name.try_into() {
             Ok(r) => r,
-            Err(NulByte {}) => return Err(TLSError::General("NUL byte in SNI".to_string())),
+            Err(NulByte {}) => return Err(rustls::Error::General("NUL byte in SNI".to_string())),
         };
-        let mut certificates: Vec<&[u8]> = presented_certs
-            .iter()
-            .map(|cert: &Certificate| cert.as_ref())
+
+        let intermediates: Vec<_> = intermediates
+            .into_iter()
+            .map(|cert| cert.as_ref())
             .collect();
-        // In https://github.com/ctz/rustls/pull/462 (unreleased as of 0.19.0),
-        // rustls changed the verifier API to separate the end entity and intermediates.
-        // We anticipate that API by doing it ourselves.
-        let end_entity = match certificates.pop() {
-            Some(c) => c,
-            None => {
-                return Err(TLSError::General(
-                    "missing end-entity certificate".to_string(),
-                ))
-            }
-        };
+
         let intermediates = rustls_slice_slice_bytes {
-            inner: &*certificates,
+            inner: &*intermediates,
         };
 
         let params = rustls_verify_server_cert_params {
-            roots: (roots as *const RootCertStore) as *const rustls_root_cert_store,
-            end_entity_cert_der: end_entity.into(),
+            roots: (&self.roots as *const RootCertStore) as *const rustls_root_cert_store,
+            end_entity_cert_der: end_entity.as_ref().into(),
             intermediate_certs_der: &intermediates,
             dns_name: dns_name.into(),
             ocsp_response: ocsp_response.into(),
         };
         let userdata = userdata_get().map_err(|_| {
-            TLSError::General("internal error with thread-local storage".to_string())
+            rustls::Error::General("internal error with thread-local storage".to_string())
         })?;
         let result: rustls_result = unsafe { cb(userdata, &params) };
         match result {
             rustls_result::Ok => Ok(ServerCertVerified::assertion()),
-            r => match result_to_tlserror(&r) {
-                error::Either::TLSError(te) => Err(te),
-                error::Either::String(se) => Err(TLSError::General(se)),
+            r => match result_to_error(&r) {
+                error::Either::Error(te) => Err(te),
+                error::Either::String(se) => Err(rustls::Error::General(se)),
             },
         }
     }
@@ -225,7 +217,7 @@ impl rustls::ServerCertVerifier for Verifier {
 /// If you intend to write a verifier that accepts all certificates, be aware
 /// that special measures are required for IP addresses. Rustls currently
 /// (0.19.0) doesn't support building a ClientSession with an IP address
-/// (because it's not a valid DNSNameRef). One workaround is to detect IP
+/// (because it's not a valid DnsNameRef). One workaround is to detect IP
 /// addresses and rewrite them to `example.invalid`, and _also_ to disable
 /// SNI via rustls_client_config_builder_set_enable_sni (IP addresses don't
 /// need SNI).
@@ -376,7 +368,7 @@ pub extern "C" fn rustls_client_config_builder_set_protocols(
             let v: &[u8] = try_slice!(p.data, p.len);
             vv.push(v.to_vec());
         }
-        config.set_protocols(&vv);
+        config.alpn_protocols = vv;
         rustls_result::Ok
     }
 }
@@ -408,15 +400,15 @@ pub extern "C" fn rustls_client_config_builder_set_ciphersuites(
     ffi_panic_boundary! {
         let config: &mut ClientConfig = try_mut_from_ptr!(builder);
         let ciphersuites: &[*const rustls_supported_ciphersuite] = try_slice!(ciphersuites, len);
-        let mut cs_vec: Vec<&'static SupportedCipherSuite> = Vec::new();
+        let mut cs_vec: Vec<SupportedCipherSuite> = Vec::new();
         for &cs in ciphersuites.into_iter() {
             let cs = try_ref_from_ptr!(cs);
             match ALL_CIPHERSUITES.iter().find(|&acs| cs.eq(acs)) {
-                Some(scs) => cs_vec.push(scs),
+                Some(scs) => cs_vec.push(scs.clone()),
                 None => return InvalidParameter,
             }
         }
-        config.ciphersuites = cs_vec;
+        config.cipher_suites = cs_vec;
         rustls_result::Ok
     }
 }
@@ -481,50 +473,20 @@ pub extern "C" fn rustls_client_connection_new(
             Ok(s) => s,
             Err(std::str::Utf8Error { .. }) => return rustls_result::InvalidDnsNameError,
         };
-        let name_ref = match webpki::DNSNameRef::try_from_ascii_str(hostname) {
-            Ok(nr) => nr,
-            Err(webpki::InvalidDNSNameError { .. }) => return rustls_result::InvalidDnsNameError,
+        let server_name: rustls::ServerName = match hostname.try_into() {
+            Ok(sn) => sn,
+            Err(_) => return rustls_result::InvalidDnsNameError,
         };
+        let client = ClientConnection::new(config, server_name).unwrap();
 
         // We've succeeded. Put the client on the heap, and transfer ownership
         // to the caller. After this point, we must return CRUSTLS_OK so the
         // caller knows it is responsible for this memory.
-        let c = Connection::from_client( ClientSession::new(&config, name_ref));
+        let c = Connection::from_client(client);
         unsafe {
             *conn_out = Box::into_raw(Box::new(c)) as *mut _;
         }
 
         return rustls_result::Ok;
-    }
-}
-
-/// Register callbacks for persistence of TLS session data. This means either
-/// session IDs (TLSv1.2) or . Both
-/// keys and values are highly sensitive data, containing enough information
-/// to break the security of the sessions involved.
-///
-/// If `userdata` has been set with rustls_connection_set_userdata, it
-/// will be passed to the callbacks. Otherwise the userdata param passed to
-/// the callbacks will be NULL.
-#[no_mangle]
-pub extern "C" fn rustls_client_config_builder_set_persistence(
-    builder: *mut rustls_client_config_builder,
-    get_cb: rustls_session_store_get_callback,
-    put_cb: rustls_session_store_put_callback,
-) -> rustls_result {
-    ffi_panic_boundary! {
-        let get_cb: SessionStoreGetCallback = match get_cb {
-            Some(cb) => cb,
-            None => return rustls_result::NullParameter,
-        };
-        let put_cb: SessionStorePutCallback = match put_cb {
-            Some(cb) => cb,
-            None => return rustls_result::NullParameter,
-        };
-        let config: &mut ClientConfig = try_mut_from_ptr!(builder);
-        config.set_persistence(Arc::new(SessionStoreBroker::new(
-            get_cb, put_cb
-        )));
-        rustls_result::Ok
     }
 }
